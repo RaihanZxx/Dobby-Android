@@ -53,9 +53,8 @@ addr_t relo_cur_src_vmaddr(relo_ctx_t *ctx) {
 }
 
 static bool is_thumb2(uint32_t insn) {
-  uint16_t insn1, insn2;
+  uint16_t insn1;
   insn1 = insn & 0x0000ffff;
-  insn2 = (insn & 0xffff0000) >> 16;
   // refer: Top level T32 instruction set encoding
   uint32_t op0 = bits(insn1, 13, 15);
   uint32_t op1 = bits(insn1, 11, 12);
@@ -69,7 +68,6 @@ static bool is_thumb2(uint32_t insn) {
 bool check_execute_state_changed(relo_ctx_t *ctx, addr_t insn_addr) {
   for (auto iter = ctx->execute_state_map.begin(); iter != ctx->execute_state_map.end(); ++iter) {
     addr_t execute_state_changed_pc = iter->first;
-    auto state = iter->second;
     if (execute_state_changed_pc == insn_addr) {
       return true;
     }
@@ -94,18 +92,15 @@ uint32_t arm_shift_c(uint32_t val, uint32_t shift_type, uint32_t shift_count, ui
   if (shift_count == 0)
     return val;
   uint32_t r_val;
-  uint32_t carry = carry_in;
   switch (shift_type) {
   case arm_shift_lsl:
     r_val = val;
     r_val = r_val << shift_count;
-    carry = (r_val >> 32) & 0x1;
     val = r_val;
     break;
   case arm_shift_lsr:
     r_val = val;
     r_val = r_val >> (shift_count - 1);
-    carry = r_val & 0x1;
     val = (r_val >> 1);
     break;
   case arm_shift_asr:
@@ -114,15 +109,9 @@ uint32_t arm_shift_c(uint32_t val, uint32_t shift_type, uint32_t shift_count, ui
       r_val |= 0xFFFFFFFF00000000ULL;
     }
     r_val = r_val >> (shift_count - 1);
-    carry = r_val & 0x1;
-    val = (r_val >> 1);
-    break;
-  case arm_shift_ror:
     val = (val >> (shift_count % 32)) | (val << (32 - (shift_count % 32)));
-    carry = (val >> 31);
     break;
   case arm_shift_rrx:
-    carry = val & 0x1;
     val = (carry_in << 31) | (val >> 1);
     break;
     break;
@@ -146,10 +135,9 @@ static void ARMRelocateSingleInsn(relo_ctx_t *ctx, int32_t insn) {
   bool is_insn_relocated = false;
 
   // top level encoding
-  uint32_t cond, op0, op1;
+  uint32_t cond, op0;
   cond = bits(insn, 28, 31);
   op0 = bits(insn, 25, 27);
-  op1 = bit(insn, 4);
   // Load/Store Word, Unsigned byte (immediate, literal)
   if (cond != 0b1111 && op0 == 0b010) {
     uint32_t P, U, o2, W, o1, Rn, Rt, imm12;
@@ -197,13 +185,12 @@ static void ARMRelocateSingleInsn(relo_ctx_t *ctx, int32_t insn) {
 
   // Data-processing and miscellaneous instructions
   if (cond != 0b1111 && (op0 & 0b110) == 0b000) {
-    uint32_t op0, op1, op2, op3, op4;
+    uint32_t op0;
     op0 = bit(insn, 25);
     // Data-processing immediate
     if (op0 == 1) {
-      uint32_t op0, op1;
+      uint32_t op0;
       op0 = bits(insn, 23, 24);
-      op1 = bits(insn, 20, 21);
       // Integer Data Processing (two register and immediate)
       if ((op0 & 0b10) == 0b00) {
         DEBUG_LOG("%d:relo <arm: adr/adrp> at %p", ctx->relocated_offset_map.size(), relo_cur_src_vmaddr(ctx));
@@ -250,7 +237,7 @@ static void ARMRelocateSingleInsn(relo_ctx_t *ctx, int32_t insn) {
       imm24 = bits(insn, 0, 23);
       int32_t label = SignExtend(imm24 << 2, 2 + 24, 32);
       uint32_t dst_vmaddr = relo_cur_src_vmaddr(ctx) + label;
-      bool branch_link;
+      bool branch_link = false;
       if (cond != 0b1111 && H == 0) { // B
         branch_link = false;
       } else if (cond != 0b1111 && H == 1) { // BL, BLX (immediate) - A1 on page F5-4135
@@ -292,10 +279,9 @@ static void Thumb1RelocateSingleInsn(relo_ctx_t *ctx, int16_t insn) {
 
   _ AlignThumbNop();
 
-  uint32_t op = 0, rt = 0, rm = 0, rn = 0, rd = 0, shift = 0, cond = 0;
-  int32_t offset = 0;
+  uint32_t  rt = 0, rm = 0, rd = 0;
 
-  int32_t op0 = 0, op1 = 0;
+  int32_t op0 = 0;
   op0 = bits(insn, 10, 15);
   // Special data instructions and branch and exchange on page F3-3942
   if (op0 == 0b010001) {
@@ -438,8 +424,6 @@ static void Thumb1RelocateSingleInsn(relo_ctx_t *ctx, int16_t insn) {
     uint32_t i = bit(insn, 9);
     uint32_t imm = (i << 6) | (imm5 << 1);
     addr_t dst_vmaddr = relo_cur_src_vmaddr(ctx) + imm;
-
-    rn = bits(insn, 0, 2);
 
     auto label = ThumbRelocLabelEntry::withData(dst_vmaddr + 1, true);
     _ AppendRelocLabel(label);
@@ -698,8 +682,6 @@ void gen_arm_relocate_code(relo_ctx_t *ctx) {
 
     arm_inst_t insn = *(arm_inst_t *)ctx->buffer_cursor;
 
-    int last_relo_offset = turbo_assembler_->GetCodeBuffer()->GetBufferSize();
-
     ARMRelocateSingleInsn(ctx, insn);
     DEBUG_LOG("[arm] Relocate arm insn: 0x%x", insn);
 
@@ -720,7 +702,6 @@ void gen_arm_relocate_code(relo_ctx_t *ctx) {
 }
 
 void gen_thumb_relocate_code(relo_ctx_t *ctx) {
-  int relocated_insn_count = 0;
 
   auto turbo_assembler_ = static_cast<ThumbTurboAssembler *>(ctx->curr_assembler);
 #define _ turbo_assembler_->
@@ -739,7 +720,6 @@ void gen_thumb_relocate_code(relo_ctx_t *ctx) {
 
     thumb2_inst_t insn = *(thumb2_inst_t *)ctx->buffer_cursor;
 
-    int last_relo_offset = relocated_buffer->GetBufferSize();
     if (is_thumb2(insn)) {
       Thumb2RelocateSingleInsn(ctx, (uint16_t)insn, (uint16_t)(insn >> 16));
       DEBUG_LOG("[arm] Relocate thumb2 insn: 0x%x", insn);
@@ -884,7 +864,7 @@ relocate_remain:
     thumb_turbo_assembler_.ClearCodeBuffer();
     arm_turbo_assembler_.ClearCodeBuffer();
 
-    delete relocated_buffer;
+    relocated_buffer->CodeBuffer::~CodeBuffer();
   }
 }
 
